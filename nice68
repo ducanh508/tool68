@@ -1,0 +1,636 @@
+import os
+import logging
+from datetime import datetime, timedelta
+import pytz
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler,
+)
+
+# Configuration
+TOKEN = "8348229333:AAEvTfpCwi0hznCmAgaL4KVY-MOjQJdrSDM"
+ADMIN_USERNAME = "@bevis1312"
+ADMIN_PASSWORD = "bevis"
+API_URL = "https://six8vip-okhx.onrender.com/myapi/taixiu/history"
+
+# States for conversation
+PASSWORD, ACTIVE_GROUP, MODEL_GROUP, WELCOME_MESSAGE, SEND_MESSAGE = range(5)
+
+# Global variables
+active_groups = {}
+model1_active = {}
+model2_active = {}
+model1_stats = {"total": 0, "correct": 0}
+model2_stats = {"total": 0, "correct": 0}
+current_strategy_model2 = "default"  # default: even->xỉu, odd->tài | reversed: even->tài, odd->xỉu
+welcome_messages = {}
+auto_replies = {
+    "link": "https://sites.google.com/view/vipcode88k",
+    "ngu": "có mày ngu",
+    "cặc": "thằng bên trên tôi không có cu",
+    "lỏ": "hơn thằng bại não",
+    "bot": "đây bot đây"
+}
+
+# Set up logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Helper functions
+def vietnam_time():
+    return datetime.now(pytz.timezone('Asia/Ho_Chi_Minh'))
+
+def format_time(dt):
+    return dt.strftime("%H:%M:%S %d/%m/%Y")
+
+def calculate_sum(dice):
+    return sum(dice)
+
+def is_tai(sum_dice):
+    return sum_dice >= 11
+
+def predict_model1(history):
+    """Predict using model1 algorithm"""
+    if not history:
+        return None
+    
+    # Get the latest game
+    latest_game = history[0]
+    dice = latest_game['dice']
+    sum_dice = calculate_sum(dice)
+    
+    # Simple prediction model - based on recent trends
+    tai_count = 0
+    xiu_count = 0
+    
+    for game in history[:10]:  # Look at last 10 games
+        if is_tai(calculate_sum(game['dice'])):
+            tai_count += 1
+        else:
+            xiu_count += 1
+    
+    # Calculate probabilities
+    total_games = tai_count + xiu_count
+    if total_games == 0:
+        return None
+    
+    tai_prob = tai_count / total_games
+    xiu_prob = xiu_count / total_games
+    
+    # Determine prediction
+    prediction = "Tài" if tai_prob > xiu_prob else "Xỉu"
+    win_rate = max(tai_prob, xiu_prob) * 100
+    
+    return {
+        "prediction": prediction,
+        "win_rate": win_rate,
+        "dice": [dice[0] % 6 + 1, dice[1] % 6 + 1, dice[2] % 6 + 1]  # Modified dice based on prediction
+    }
+
+def predict_model2(history):
+    """Predict using model2 algorithm"""
+    global current_strategy_model2
+    
+    if not history:
+        return None
+    
+    # Get the latest game
+    latest_game = history[0]
+    game_id = latest_game['game_id']
+    dice = latest_game['dice']
+    sum_dice = calculate_sum(dice)
+    
+    # Extract last digit of game ID
+    last_digit_id = int(str(game_id)[-1])
+    
+    # Sum of last digits of dice
+    last_digits_dice = sum([d % 10 for d in dice])
+    
+    # Total sum
+    total = last_digit_id + last_digits_dice
+    
+    # Determine if even or odd
+    is_even = total % 2 == 0
+    
+    # Apply current strategy
+    if current_strategy_model2 == "default":
+        prediction = "Xỉu" if is_even else "Tài"
+    else:
+        prediction = "Tài" if is_even else "Xỉu"
+    
+    return {
+        "prediction": prediction,
+        "dice": dice,
+        "sum_dice": sum_dice,
+        "is_even": is_even
+    }
+
+def update_model2_strategy(was_correct):
+    """Update model2 strategy based on last prediction result"""
+    global current_strategy_model2
+    
+    if not was_correct:
+        if current_strategy_model2 == "default":
+            current_strategy_model2 = "reversed"
+        else:
+            current_strategy_model2 = "default"
+
+async def fetch_game_history():
+    try:
+        response = requests.get(API_URL)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            logger.error(f"Failed to fetch game history: {response.status_code}")
+            return None
+    except Exception as e:
+        logger.error(f"Error fetching game history: {e}")
+        return None
+
+async def check_new_games(context: ContextTypes.DEFAULT_TYPE):
+    """Check for new games and send predictions to active groups"""
+    history = await fetch_game_history()
+    if not history:
+        return
+    
+    # Check model1 active groups
+    for chat_id in list(model1_active.keys()):
+        try:
+            latest_game = history[0]
+            game_id = latest_game['game_id']
+            
+            # Check if we've already processed this game
+            if 'last_game_id' not in model1_active[chat_id] or model1_active[chat_id]['last_game_id'] != game_id:
+                model1_active[chat_id]['last_game_id'] = game_id
+                
+                # Make prediction for next game
+                prediction = predict_model1(history)
+                if prediction:
+                    # Format message
+                    dice = latest_game['dice']
+                    sum_dice = calculate_sum(dice)
+                    result = "Tài" if is_tai(sum_dice) else "Xỉu"
+                    
+                    message = (
+                        f"DỰ ĐOÁN TÀI XỈU BÀN ĐỎ MD5\n"
+                        f"Ván #{game_id}, Kết quả: {result}, Số xí ngầu: {dice[0]}-{dice[1]}-{dice[2]}, lúc: {format_time(vietnam_time())}\n"
+                        f"Dự đoán ván: #{game_id + 1}, Kết quả: {prediction['prediction']}, Tỉ lệ thắng: {prediction['win_rate']:.2f}%\n"
+                        f"Số ván đã dự đoán: {model1_stats['total']}\n"
+                        f"Số ván đúng: {model1_stats['correct']}/Số ván sai: {model1_stats['total'] - model1_stats['correct']}"
+                    )
+                    
+                    # Send message to group
+                    await context.bot.send_message(chat_id=chat_id, text=message)
+                    
+                    # Update stats after the actual result is known (next game)
+                    if 'last_prediction' in model1_active[chat_id]:
+                        model1_stats['total'] += 1
+                        if model1_active[chat_id]['last_prediction'] == result:
+                            model1_stats['correct'] += 1
+                    
+                    # Store current prediction for next evaluation
+                    model1_active[chat_id]['last_prediction'] = prediction['prediction']
+        except Exception as e:
+            logger.error(f"Error in model1 for chat {chat_id}: {e}")
+    
+    # Check model2 active groups
+    for chat_id in list(model2_active.keys()):
+        try:
+            latest_game = history[0]
+            game_id = latest_game['game_id']
+            
+            # Check if we've already processed this game
+            if 'last_game_id' not in model2_active[chat_id] or model2_active[chat_id]['last_game_id'] != game_id:
+                model2_active[chat_id]['last_game_id'] = game_id
+                
+                # Make prediction for next game
+                prediction = predict_model2(history)
+                if prediction:
+                    # Format message
+                    result = "Tài" if is_tai(prediction['sum_dice']) else "Xỉu"
+                    
+                    message = (
+                        f"DỰ ĐOÁN TÀI XỈU MODEL 2\n"
+                        f"Ván #{game_id}, Kết quả: {result}, Số xí ngầu: {prediction['dice'][0]}-{prediction['dice'][1]}-{prediction['dice'][2]}, lúc: {format_time(vietnam_time())}\n"
+                        f"Dự đoán ván: #{game_id + 1}, Kết quả: {prediction['prediction']} (Chiến thuật: {'Chẵn->Xỉu, Lẻ->Tài' if current_strategy_model2 == 'default' else 'Chẵn->Tài, Lẻ->Xỉu'})\n"
+                        f"Số ván đã dự đoán: {model2_stats['total']}\n"
+                        f"Số ván đúng: {model2_stats['correct']}/Số ván sai: {model2_stats['total'] - model2_stats['correct']}"
+                    )
+                    
+                    # Send message to group
+                    await context.bot.send_message(chat_id=chat_id, text=message)
+                    
+                    # Update stats and strategy
+                    if 'last_prediction' in model2_active[chat_id]:
+                        model2_stats['total'] += 1
+                        was_correct = model2_active[chat_id]['last_prediction'] == result
+                        if was_correct:
+                            model2_stats['correct'] += 1
+                        update_model2_strategy(was_correct)
+                    
+                    # Store current prediction for next evaluation
+                    model2_active[chat_id]['last_prediction'] = prediction['prediction']
+        except Exception as e:
+            logger.error(f"Error in model2 for chat {chat_id}: {e}")
+
+# Command handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a message when the command /start is issued."""
+    user = update.effective_user
+    if user.username == ADMIN_USERNAME[1:]:  # Remove @
+        await update.message.reply_text(
+            "Xin chào Admin! Vui lòng nhập mật khẩu để đăng nhập vào tool."
+        )
+        return PASSWORD
+    else:
+        await update.message.reply_text(
+            "Xin chào! Tôi là bot Tài Xỉu. Vui lòng liên hệ admin để được hỗ trợ."
+        )
+        return ConversationHandler.END
+
+async def verify_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Verify admin password."""
+    if update.message.text == ADMIN_PASSWORD:
+        await update.message.reply_text(
+            "Xác thực thành công! Bạn có thể sử dụng các lệnh admin bằng cách gõ /menu"
+        )
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text(
+            "Mật khẩu không đúng. Vui lòng thử lại hoặc liên hệ admin."
+        )
+        return PASSWORD
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the admin menu."""
+    if update.effective_user.username != ADMIN_USERNAME[1:]:
+        await update.message.reply_text("Bạn không có quyền truy cập menu này.")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("Active Group", callback_data='activegroup')],
+        [InlineKeyboardButton("Model 1", callback_data='model1')],
+        [InlineKeyboardButton("Model 2", callback_data='model2')],
+        [InlineKeyboardButton("Running Bot Groups", callback_data='runningbotgroup')],
+        [InlineKeyboardButton("Add Welcome Message", callback_data='addwelcome')],
+        [InlineKeyboardButton("Send Message", callback_data='send')],
+        [InlineKeyboardButton("Menu Stats", callback_data='menustats')],
+        [InlineKeyboardButton("Stop Models", callback_data='stopmodels')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "MENU ADMIN - Chọn chức năng bạn muốn:",
+        reply_markup=reply_markup
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button callbacks from the menu."""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'activegroup':
+        await query.edit_message_text("Vui lòng gửi link nhóm hoặc tên nhóm bạn muốn bot hoạt động:")
+        return ACTIVE_GROUP
+    elif query.data == 'model1':
+        if not active_groups:
+            await query.edit_message_text("Chưa có group nào được active. Vui lòng active group trước.")
+            return ConversationHandler.END
+        
+        keyboard = [
+            [InlineKeyboardButton(group_name, callback_data=f'model1_{chat_id}')]
+            for chat_id, group_name in active_groups.items()
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "Chọn group bạn muốn chạy Model 1:",
+            reply_markup=reply_markup
+        )
+    elif query.data == 'model2':
+        if not active_groups:
+            await query.edit_message_text("Chưa có group nào được active. Vui lòng active group trước.")
+            return ConversationHandler.END
+        
+        keyboard = [
+            [InlineKeyboardButton(group_name, callback_data=f'model2_{chat_id}')]
+            for chat_id, group_name in active_groups.items()
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "Chọn group bạn muốn chạy Model 2:",
+            reply_markup=reply_markup
+        )
+    elif query.data.startswith('model1_'):
+        chat_id = int(query.data.split('_')[1])
+        group_name = active_groups.get(chat_id, "Unknown Group")
+        
+        if chat_id in model1_active:
+            await query.edit_message_text(f"Model 1 đã được kích hoạt trong group {group_name}.")
+        else:
+            model1_active[chat_id] = {"last_game_id": None, "last_prediction": None}
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"Admin đã kích hoạt dự đoán Tài Xỉu Model 1 trong group này!"
+            )
+            await query.edit_message_text(f"Đã kích hoạt Model 1 trong group {group_name}.")
+    elif query.data.startswith('model2_'):
+        chat_id = int(query.data.split('_')[1])
+        group_name = active_groups.get(chat_id, "Unknown Group")
+        
+        if chat_id in model2_active:
+            await query.edit_message_text(f"Model 2 đã được kích hoạt trong group {group_name}.")
+        else:
+            model2_active[chat_id] = {"last_game_id": None, "last_prediction": None}
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"Admin đã kích hoạt dự đoán Tài Xỉu Model 2 trong group này!"
+            )
+            await query.edit_message_text(f"Đã kích hoạt Model 2 trong group {group_name}.")
+    elif query.data == 'runningbotgroup':
+        if not active_groups:
+            await query.edit_message_text("Không có group nào đang hoạt động.")
+        else:
+            groups_list = "\n".join([f"- {name}" for name in active_groups.values()])
+            await query.edit_message_text(f"Các group đang hoạt động:\n{groups_list}")
+    elif query.data == 'addwelcome':
+        if not active_groups:
+            await query.edit_message_text("Chưa có group nào được active. Vui lòng active group trước.")
+            return ConversationHandler.END
+        
+        keyboard = [
+            [InlineKeyboardButton(group_name, callback_data=f'welcome_{chat_id}')]
+            for chat_id, group_name in active_groups.items()
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "Chọn group bạn muốn thêm câu chào:",
+            reply_markup=reply_markup
+        )
+    elif query.data.startswith('welcome_'):
+        chat_id = int(query.data.split('_')[1])
+        context.user_data['welcome_chat_id'] = chat_id
+        await query.edit_message_text("Vui lòng gửi nội dung chào mà bạn muốn set up cho group này:")
+        return WELCOME_MESSAGE
+    elif query.data == 'send':
+        if not active_groups:
+            await query.edit_message_text("Chưa có group nào được active. Vui lòng active group trước.")
+            return ConversationHandler.END
+        
+        keyboard = [
+            [InlineKeyboardButton(group_name, callback_data=f'send_{chat_id}')]
+            for chat_id, group_name in active_groups.items()
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "Chọn group bạn muốn gửi tin nhắn:",
+            reply_markup=reply_markup
+        )
+    elif query.data.startswith('send_'):
+        chat_id = int(query.data.split('_')[1])
+        context.user_data['send_chat_id'] = chat_id
+        await query.edit_message_text("Vui lòng gửi nội dung bạn muốn gửi đến group:")
+        return SEND_MESSAGE
+    elif query.data == 'menustats':
+        await query.edit_message_text(
+            "MENU STATS:\n"
+            "/statsmodel1 - Xem thống kê Model 1\n"
+            "/statsmodel2 - Xem thống kê Model 2\n"
+            "/statsgroup - Xem thống kê group"
+        )
+    elif query.data == 'stopmodels':
+        if not model1_active and not model2_active:
+            await query.edit_message_text("Không có model nào đang chạy.")
+            return
+        
+        keyboard = []
+        if model1_active:
+            keyboard.append([InlineKeyboardButton("Dừng Model 1", callback_data='stop_model1')])
+        if model2_active:
+            keyboard.append([InlineKeyboardButton("Dừng Model 2", callback_data='stop_model2')])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "Chọn model bạn muốn dừng:",
+            reply_markup=reply_markup
+        )
+    elif query.data == 'stop_model1':
+        for chat_id in list(model1_active.keys()):
+            group_name = active_groups.get(chat_id, "Unknown Group")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Model 1 đã bị dừng bởi admin. Bot sẽ không dự đoán nữa."
+            )
+            model1_active.pop(chat_id)
+        await query.edit_message_text("Đã dừng tất cả các instance của Model 1.")
+    elif query.data == 'stop_model2':
+        for chat_id in list(model2_active.keys()):
+            group_name = active_groups.get(chat_id, "Unknown Group")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Model 2 đã bị dừng bởi admin. Bot sẽ không dự đoán nữa."
+            )
+            model2_active.pop(chat_id)
+        await query.edit_message_text("Đã dừng tất cả các instance của Model 2.")
+
+async def active_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle active group input."""
+    group_info = update.message.text
+    chat_id = update.message.chat_id
+    
+    # For simplicity, we'll use the current chat as the active group
+    # In a real implementation, you'd need to parse group links/names
+    if chat_id not in active_groups:
+        active_groups[chat_id] = update.message.chat.title or "Unknown Group"
+        await update.message.reply_text(
+            f"Đã thêm group {active_groups[chat_id]} vào danh sách active groups."
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"Group này đã được admin kích hoạt cho bot hoạt động!"
+        )
+    else:
+        await update.message.reply_text(
+            f"Group {active_groups[chat_id]} đã được kích hoạt trước đó."
+        )
+    
+    return ConversationHandler.END
+
+async def welcome_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle welcome message input."""
+    chat_id = context.user_data.get('welcome_chat_id')
+    if not chat_id:
+        await update.message.reply_text("Có lỗi xảy ra. Vui lòng thử lại.")
+        return ConversationHandler.END
+    
+    welcome_messages[chat_id] = update.message.text
+    await update.message.reply_text(
+        f"Đã set up câu chào cho group {active_groups.get(chat_id, 'Unknown Group')}."
+    )
+    return ConversationHandler.END
+
+async def send_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle send message to group."""
+    chat_id = context.user_data.get('send_chat_id')
+    if not chat_id:
+        await update.message.reply_text("Có lỗi xảy ra. Vui lòng thử lại.")
+        return ConversationHandler.END
+    
+    message = update.message.text
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=message
+    )
+    await update.message.reply_text(
+        f"Đã gửi tin nhắn đến group {active_groups.get(chat_id, 'Unknown Group')}."
+    )
+    return ConversationHandler.END
+
+async def stats_model1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show stats for model1."""
+    if model1_stats['total'] == 0:
+        await update.message.reply_text("Model 1 chưa có dữ liệu thống kê.")
+    else:
+        accuracy = (model1_stats['correct'] / model1_stats['total']) * 100
+        await update.message.reply_text(
+            f"THỐNG KÊ MODEL 1:\n"
+            f"Số ván đã dự đoán: {model1_stats['total']}\n"
+            f"Số ván đúng: {model1_stats['correct']}\n"
+            f"Số ván sai: {model1_stats['total'] - model1_stats['correct']}\n"
+            f"Tỉ lệ chính xác: {accuracy:.2f}%"
+        )
+
+async def stats_model2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show stats for model2."""
+    if model2_stats['total'] == 0:
+        await update.message.reply_text("Model 2 chưa có dữ liệu thống kê.")
+    else:
+        accuracy = (model2_stats['correct'] / model2_stats['total']) * 100
+        await update.message.reply_text(
+            f"THỐNG KÊ MODEL 2:\n"
+            f"Số ván đã dự đoán: {model2_stats['total']}\n"
+            f"Số ván đúng: {model2_stats['correct']}\n"
+            f"Số ván sai: {model2_stats['total'] - model2_stats['correct']}\n"
+            f"Tỉ lệ chính xác: {accuracy:.2f}%\n"
+            f"Chiến thuật hiện tại: {'Chẵn->Xỉu, Lẻ->Tài' if current_strategy_model2 == 'default' else 'Chẵn->Tài, Lẻ->Xỉu'}"
+        )
+
+async def tx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /tx command with dice numbers."""
+    if len(context.args) != 3:
+        await update.message.reply_text("Vui lòng nhập đúng định dạng: /tx [số1] [số2] [số3]")
+        return
+    
+    try:
+        dice = [int(num) for num in context.args]
+        if any(num < 1 or num > 6 for num in dice):
+            await update.message.reply_text("Số xí ngầu phải từ 1 đến 6.")
+            return
+        
+        sum_dice = sum(dice)
+        result = "Tài" if sum_dice >= 11 else "Xỉu"
+        
+        # Predict next dice (using a simple algorithm based on current dice)
+        # This is a placeholder - you should implement your own prediction algorithm
+        predicted_dice = [
+            (dice[0] + 1) % 6 + 1,
+            (dice[1] + 2) % 6 + 1,
+            (dice[2] + 3) % 6 + 1
+        ]
+        predicted_sum = sum(predicted_dice)
+        predicted_result = "Tài" if predicted_sum >= 11 else "Xỉu"
+        
+        # Calculate win rate (placeholder)
+        win_rate = 75.0  # This should be calculated based on your algorithm
+        
+        await update.message.reply_text(
+            f"Kết quả của bạn: {dice[0]}-{dice[1]}-{dice[2]} - {result} {sum_dice} - Lúc: {format_time(vietnam_time())}\n"
+            f"Kết quả bot dự đoán: {predicted_dice[0]}-{predicted_dice[1]}-{predicted_dice[2]} - {predicted_result} - Tỉ lệ thắng: {win_rate}%"
+        )
+    except ValueError:
+        await update.message.reply_text("Vui lòng nhập số hợp lệ từ 1 đến 6.")
+
+async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle messages in groups with auto-replies."""
+    if update.message.chat.id not in active_groups:
+        return
+    
+    text = update.message.text.lower()
+    
+    # Check for auto-reply keywords
+    for keyword, reply in auto_replies.items():
+        if keyword in text:
+            await update.message.reply_text(reply)
+            break
+    
+    # Check for welcome message (new member)
+    if update.message.new_chat_members:
+        welcome_msg = welcome_messages.get(update.message.chat.id, "Chào mừng thành viên mới!")
+        for member in update.message.new_chat_members:
+            await update.message.reply_text(
+                f"{welcome_msg} {member.full_name}!"
+            )
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the current conversation."""
+    await update.message.reply_text("Đã hủy thao tác hiện tại.")
+    return ConversationHandler.END
+
+def main():
+    """Start the bot."""
+    # Create the Application and pass it your bot's token.
+    application = Application.builder().token(TOKEN).build()
+    
+    # Add conversation handler for authentication
+    auth_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, verify_password)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    
+    # Add conversation handler for admin commands
+    admin_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('menu', menu)],
+        states={
+            ACTIVE_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, active_group)],
+            WELCOME_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, welcome_message)],
+            SEND_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, send_message)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    
+    # Add handlers
+    application.add_handler(auth_conv_handler)
+    application.add_handler(admin_conv_handler)
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(CommandHandler('statsmodel1', stats_model1))
+    application.add_handler(CommandHandler('statsmodel2', stats_model2))
+    application.add_handler(CommandHandler('tx', tx_command))
+    
+    # Add handler for group messages
+    application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, handle_group_message))
+    
+    # Add job queue to check for new games
+    job_queue = application.job_queue
+    job_queue.run_repeating(check_new_games, interval=10.0, first=0.0)
+    
+    # Run the bot until the user presses Ctrl-C
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
